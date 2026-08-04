@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Telegram Bot Status"
+description = "A lightweight public status page for the continuously running Telegram bot, showing live health state, last check time, and monitoring guidance."
+version = "1.0.0"
+id = "artifacts/bot-status"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22053
+
+[services.development]
+run = "pnpm --filter @workspace/bot-status run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bot-status", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bot-status/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22053"
+BASE_PATH = "/"
