@@ -1,0 +1,5 @@
+aiohttp>=3.10,<4
+motor>=3.6,<4
+python-telegram-bot>=22.0,<23
+qrcode[pil]>=8.0,<9
+Telethon>=1.40,<2

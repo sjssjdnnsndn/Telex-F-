@@ -10,6 +10,13 @@ out-tsc
 
 # dependencies
 node_modules
+bot-runtime/.venv
+bot-runtime/transaction/
+bot-runtime/*.session
+bot-runtime/*.session-journal
+bot-runtime/.sessions/
+__pycache__/
+*.py[cod]
 
 # IDEs and editors
 /.idea

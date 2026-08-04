@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: upi
+    description: UPI deposit verification for the Telegram mini app
 paths:
   /healthz:
     get:
@@ -24,6 +26,143 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /upi/payment-info:
+    get:
+      operationId: getPaymentInfo
+      tags: [upi]
+      summary: Get the admin's UPI QR code and UPI ID
+      description: Returns the payment details the mini app should display for deposits
+      responses:
+        "200":
+          description: Payment info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentInfo"
+  /upi/balance/{telegramUserId}:
+    get:
+      operationId: getUpiBalance
+      tags: [upi]
+      summary: Get a user's bot balance
+      parameters:
+        - name: telegramUserId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceInfo"
+        "400":
+          description: Invalid user id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+  /upi/admin/check:
+    get:
+      operationId: checkAdmin
+      tags: [upi]
+      summary: Check whether the calling Telegram user is the configured admin
+      description: >-
+        Verifies the caller's Telegram identity from the signed initData header
+        and reports whether they match the bot's configured admin id.
+      responses:
+        "200":
+          description: Admin check result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminCheckResult"
+  /upi/admin/payment-info:
+    put:
+      operationId: updatePaymentInfo
+      tags: [upi]
+      summary: Update the UPI QR code, UPI ID, and minimum deposit (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePaymentInfoInput"
+      responses:
+        "200":
+          description: Updated payment info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentInfo"
+        "401":
+          description: Missing or invalid Telegram authentication
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+        "403":
+          description: Caller is not the configured admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+  /upi/verify-device:
+    post:
+      operationId: verifyDevice
+      tags: [upi]
+      summary: Register/check a device fingerprint to prevent multi-account referral abuse
+      description: >-
+        Verifies the caller's Telegram identity from the signed initData header,
+        then checks whether the given device fingerprint is already bound to a
+        different Telegram account. If the fingerprint is new (or already bound
+        to this same account), it is (re)bound to this account and verification
+        succeeds. If it belongs to a different account, verification fails so
+        the bot can refuse to pay out a referral bonus for this device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyDeviceInput"
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyDeviceResult"
+        "401":
+          description: Missing or invalid Telegram authentication
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+  /upi/verify:
+    post:
+      operationId: verifyUtr
+      tags: [upi]
+      summary: Verify a UTR/transaction id and credit the user's balance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UtrVerifyInput"
+      responses:
+        "200":
+          description: Payment verified and balance credited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UtrVerifyResult"
+        "400":
+          description: Invalid input, already-used UTR, or payment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +172,112 @@ components:
           type: string
       required:
         - status
+    PaymentInfo:
+      type: object
+      properties:
+        upiId:
+          type: string
+        qrImageUrl:
+          type: string
+        minDeposit:
+          type: number
+      required:
+        - upiId
+        - qrImageUrl
+        - minDeposit
+    BalanceInfo:
+      type: object
+      properties:
+        telegramUserId:
+          type: number
+        balance:
+          type: number
+      required:
+        - telegramUserId
+        - balance
+    UtrVerifyInput:
+      type: object
+      properties:
+        telegramUserId:
+          type: number
+        utr:
+          type: string
+          minLength: 6
+      required:
+        - telegramUserId
+        - utr
+    UtrVerifyResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        amount:
+          type: number
+        oldBalance:
+          type: number
+        newBalance:
+          type: number
+        utr:
+          type: string
+        ref:
+          type: string
+        date:
+          type: string
+      required:
+        - success
+        - amount
+        - oldBalance
+        - newBalance
+        - utr
+        - ref
+        - date
+    UpiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+    AdminCheckResult:
+      type: object
+      properties:
+        isAdmin:
+          type: boolean
+      required:
+        - isAdmin
+    UpdatePaymentInfoInput:
+      type: object
+      properties:
+        upiId:
+          type: string
+          minLength: 1
+        qrImageUrl:
+          type: string
+          minLength: 1
+        minDeposit:
+          type: number
+          minimum: 0
+      required:
+        - upiId
+        - qrImageUrl
+        - minDeposit
+    VerifyDeviceInput:
+      type: object
+      properties:
+        fingerprint:
+          type: string
+          minLength: 8
+      required:
+        - fingerprint
+    VerifyDeviceResult:
+      type: object
+      properties:
+        verified:
+          type: boolean
+        reason:
+          type: string
+          enum: [new_device, already_verified, duplicate_device]
+      required:
+        - verified
+        - reason
 

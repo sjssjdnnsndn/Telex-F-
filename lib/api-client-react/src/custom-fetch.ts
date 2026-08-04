@@ -17,6 +17,21 @@ const DEFAULT_JSON_ACCEPT = "application/json, application/problem+json";
 
 let _baseUrl: string | null = null;
 let _authTokenGetter: AuthTokenGetter | null = null;
+let _extraHeadersGetter: ExtraHeadersGetter | null = null;
+
+export type ExtraHeadersGetter = () =>
+  | Promise<Record<string, string> | null>
+  | Record<string, string>
+  | null;
+
+/**
+ * Register a getter for platform identity headers, such as Telegram Mini App
+ * initData. The getter runs before each request and cannot override a header
+ * explicitly provided by the caller.
+ */
+export function setExtraHeadersGetter(getter: ExtraHeadersGetter | null): void {
+  _extraHeadersGetter = getter;
+}
 
 /**
  * Set a base URL that is prepended to every relative request URL
@@ -336,6 +351,15 @@ export async function customFetch<T = unknown>(
   }
 
   const headers = mergeHeaders(isRequest(input) ? input.headers : undefined, headersInit);
+
+  if (_extraHeadersGetter) {
+    const extraHeaders = await _extraHeadersGetter();
+    if (extraHeaders) {
+      for (const [key, value] of Object.entries(extraHeaders)) {
+        if (!headers.has(key)) headers.set(key, value);
+      }
+    }
+  }
 
   if (
     typeof init.body === "string" &&

@@ -22,4 +22,5 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+  logger.info("UPI API and startup health routes are ready");
 });
