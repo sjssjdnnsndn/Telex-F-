@@ -29,6 +29,13 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Public liveness endpoint for uptime monitors/cron jobs. This route is
+// intentionally outside /api so the published app can use /ping without
+// receiving the frontend SPA fallback.
+app.get("/ping", (_req, res) => {
+  res.json({ status: "ok", service: "api-server" });
+});
+
 app.use("/api", router);
 
 export default app;

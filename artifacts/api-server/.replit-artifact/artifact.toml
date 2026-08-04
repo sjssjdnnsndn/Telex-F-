@@ -7,7 +7,7 @@ id = "3B4_FFSkEVBkAeYMFRJ2e"
 [[services]]
 localPort = 8080
 name = "API Server"
-paths = ["/api"]
+paths = ["/api", "/ping"]
 
 [services.development]
 run = "pnpm --filter @workspace/api-server run dev"
@@ -27,6 +27,9 @@ args = ["node", "--enable-source-maps", "artifacts/api-server/dist/index.mjs"]
 [services.production.run.env]
 PORT = "8080"
 NODE_ENV = "production"
+RUN_TELEGRAM_BOT = "true"
+BOT_PORT = "8000"
+MINI_APP_URL = "https://telegram-bot-deploy--matraca.replit.app/"
 
 [services.production.health.startup]
 path = "/api/healthz"
