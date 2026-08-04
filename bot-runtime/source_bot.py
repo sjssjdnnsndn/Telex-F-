@@ -45,21 +45,14 @@ USD_TO_INR_RATE = float(os.getenv("USD_TO_INR_RATE", "96.0"))
 def _resolve_mini_app_url() -> str:
     """Resolve the stable HTTPS URL for the UPI deposit mini app.
 
-    Prefers the published production domain (REPLIT_DOMAINS) and falls back to
-    the dev preview domain only for local iteration.
+    The published URL is the safe default. Replit's REPLIT_DOMAINS and
+    REPLIT_DEV_DOMAIN variables can point at an internal *.replit.dev host in
+    the workspace, which Telegram users cannot reliably resolve.
     """
     explicit = os.getenv("MINI_APP_URL")
     if explicit:
         return explicit
-    domains = os.getenv("REPLIT_DOMAINS")
-    if domains:
-        first = domains.split(",")[0].strip()
-        if first:
-            return f"https://{first}/"
-    dev_domain = os.getenv("REPLIT_DEV_DOMAIN")
-    if dev_domain:
-        return f"https://{dev_domain}/"
-    raise RuntimeError("Unable to determine mini app URL: set MINI_APP_URL.")
+    return "https://telegram-bot-deploy--matraca.replit.app/"
 
 
 MINI_APP_URL = _resolve_mini_app_url()

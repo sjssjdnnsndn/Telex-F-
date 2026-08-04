@@ -25,24 +25,13 @@ export const bot = new Telegraf(BOT_TOKEN);
 
 /**
  * The mini app must be reachable at a stable HTTPS URL for Telegram to load it.
- * In production, use the published deployment domain (REPLIT_DOMAINS). During
- * development, fall back to the dev preview domain so the button still works
- * while iterating, but this should never be relied on for the live bot.
+ * Replit's REPLIT_DOMAINS can point at an internal *.replit.dev host in the
+ * workspace, so never use it as a Telegram-facing fallback.
  */
 function getMiniAppUrl(): string {
   const explicit = process.env["MINI_APP_URL"];
   if (explicit) return explicit;
-
-  const domains = process.env["REPLIT_DOMAINS"];
-  if (domains) {
-    const first = domains.split(",")[0]?.trim();
-    if (first) return `https://${first}/`;
-  }
-
-  const devDomain = process.env["REPLIT_DEV_DOMAIN"];
-  if (devDomain) return `https://${devDomain}/`;
-
-  throw new Error("Unable to determine mini app URL: set MINI_APP_URL.");
+  return "https://telegram-bot-deploy--matraca.replit.app/";
 }
 
 function isAdmin(userId: number | undefined): boolean {
