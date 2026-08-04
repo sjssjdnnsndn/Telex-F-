@@ -162,15 +162,30 @@ export async function getDeviceFingerprintsCollection(): Promise<
 
 const DEFAULT_PAYMENT_SETTINGS: PaymentSettings = {
   _id: "payment_settings",
-  upiId: "yourupi@bank",
+  upiId: "BHARATPE.8S0S0U9S5S28572@fbpe",
   qrImageUrl: "https://i.ibb.co/B5vqn7NL/x.jpg",
   minDeposit: 1,
 };
+const PLACEHOLDER_UPI_ID = "yourupi@bank";
 
 export async function getPaymentSettings(): Promise<PaymentSettings> {
   const col = await getPaymentSettingsCollection();
   const existing = await col.findOne({ _id: "payment_settings" });
-  if (existing) return existing;
+  if (existing) {
+    if (existing.upiId === PLACEHOLDER_UPI_ID) {
+      await col.updateOne(
+        { _id: "payment_settings", upiId: PLACEHOLDER_UPI_ID },
+        { $set: { upiId: DEFAULT_PAYMENT_SETTINGS.upiId } },
+      );
+      const database = await getDb();
+      await database.collection("config").updateOne(
+        { key: "upi_id", value: PLACEHOLDER_UPI_ID },
+        { $set: { value: DEFAULT_PAYMENT_SETTINGS.upiId, updated_at: new Date() } },
+      );
+      return { ...existing, upiId: DEFAULT_PAYMENT_SETTINGS.upiId };
+    }
+    return existing;
+  }
   await col.insertOne(DEFAULT_PAYMENT_SETTINGS);
   return DEFAULT_PAYMENT_SETTINGS;
 }
