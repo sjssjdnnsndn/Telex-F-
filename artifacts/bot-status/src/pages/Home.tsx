@@ -17,6 +17,9 @@ import {
   useGetPaymentInfo, 
   useGetUpiBalance,
   useVerifyUtr,
+  useCreateDepositSession,
+  useGetDepositSession,
+  getGetDepositSessionQueryKey,
   useCheckAdmin,
   getGetUpiBalanceQueryKey,
   getCheckAdminQueryKey
@@ -62,6 +65,16 @@ type ViewState = 'deposit' | 'verifying' | 'success' | 'error';
 export default function Home() {
   const [telegramUserId] = useState<number | null>(getTelegramUserId());
   const [utr, setUtr] = useState('');
+  const [amountInr, setAmountInr] = useState('');
+  const [depositSession, setDepositSession] = useState<{
+    orderId: string;
+    amountInr: number;
+    amountUsd: number;
+    upiId: string;
+    upiLink: string;
+    qrImageUrl: string;
+    expiresAt: string;
+  } | null>(null);
   const [viewState, setViewState] = useState<ViewState>('deposit');
   const [errorMsg, setErrorMsg] = useState('');
   const [successData, setSuccessData] = useState<{ amount: number, newBalance: number, ref: string } | null>(null);
@@ -87,6 +100,25 @@ export default function Home() {
 
   // Mutation
   const verifyMutation = useVerifyUtr();
+  const createSessionMutation = useCreateDepositSession();
+  const { data: sessionStatus } = useGetDepositSession(depositSession?.orderId ?? '', {
+    query: {
+      enabled: Boolean(depositSession?.orderId) && viewState === 'deposit',
+      refetchInterval: 3000,
+      queryKey: getGetDepositSessionQueryKey(depositSession?.orderId ?? ''),
+    },
+  });
+
+  useEffect(() => {
+    if (!sessionStatus || sessionStatus.status !== 'paid' || viewState !== 'deposit') return;
+    setSuccessData({
+      amount: sessionStatus.amountInr,
+      newBalance: sessionStatus.newBalance ?? 0,
+      ref: sessionStatus.ref ?? sessionStatus.utr ?? depositSession?.orderId ?? '',
+    });
+    refetchBalance();
+    setViewState('success');
+  }, [depositSession?.orderId, refetchBalance, sessionStatus, viewState]);
 
   const handleCopyUpiId = () => {
     if (paymentInfo?.upiId) {
@@ -148,8 +180,59 @@ export default function Home() {
     });
   };
 
+  const handleCreateDeposit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!telegramUserId) {
+      toast({
+        title: "Open from Telegram",
+        description: "Please open this page using the UPI Deposit button inside the bot.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const parsedAmount = Number(amountInr);
+    const minimum = paymentInfo?.minDeposit ?? 1;
+    if (!Number.isFinite(parsedAmount) || parsedAmount < minimum) {
+      toast({
+        title: "Invalid amount",
+        description: `Please enter at least ₹${minimum}.`,
+        variant: "destructive",
+      });
+      return;
+    }
+
+    createSessionMutation.mutate(
+      { data: { amountInr: Number(parsedAmount.toFixed(2)) } },
+      {
+        onSuccess: (session) => {
+          setDepositSession(session);
+          setErrorMsg('');
+          toast({
+            title: "QR ready",
+            description: "Pay using the QR. We will verify it automatically.",
+          });
+        },
+        onError: (err: any) => {
+          const message =
+            err?.response?.data?.error ||
+            err?.message ||
+            "Could not create a payment session.";
+          setErrorMsg(message);
+          toast({
+            title: "Payment setup failed",
+            description: message,
+            variant: "destructive",
+          });
+        },
+      },
+    );
+  };
+
   const resetForm = () => {
     setUtr('');
+    setAmountInr('');
+    setDepositSession(null);
     setViewState('deposit');
     setSuccessData(null);
     setErrorMsg('');
@@ -214,89 +297,133 @@ export default function Home() {
                 </Card>
               )}
 
-              {/* QR Section */}
-              <div className="bg-white dark:bg-card border rounded-3xl p-6 shadow-sm flex flex-col items-center text-center relative overflow-hidden">
-                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary via-purple-400 to-primary"></div>
-                
-                <h2 className="text-sm font-bold text-muted-foreground uppercase tracking-wider mb-5 flex items-center gap-2">
-                  <QrCode className="h-4 w-4" />
-                  Scan to Pay
-                </h2>
-                
-                {isPaymentInfoLoading ? (
-                  <div className="w-56 h-56 bg-muted/20 animate-pulse rounded-2xl mb-4"></div>
-                ) : (
-                  <div className="qr-container bg-white p-2 rounded-2xl mb-6 relative">
-                    <img 
-                      src={paymentInfo?.qrImageUrl || 'https://api.dicebear.com/7.x/shapes/svg?seed=fallbackQR'} 
-                      alt="UPI QR Code" 
-                      className="w-52 h-52 object-cover rounded-xl"
-                    />
-                    {/* Corner accents */}
-                    <div className="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-primary rounded-tl-xl" />
-                    <div className="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-primary rounded-tr-xl" />
-                    <div className="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-primary rounded-bl-xl" />
-                    <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-primary rounded-br-xl" />
-                  </div>
-                )}
-
-                <p className="text-sm text-muted-foreground mb-2">Or pay to this UPI ID:</p>
-                <button 
-                  onClick={handleCopyUpiId}
-                  className="flex items-center gap-3 bg-secondary/50 hover:bg-secondary px-4 py-2.5 rounded-xl transition-colors active:scale-95 group"
-                  data-testid="button-copy-upi"
-                >
-                  <span className="font-semibold text-foreground tracking-wide">
-                    {isPaymentInfoLoading ? 'Loading...' : paymentInfo?.upiId}
-                  </span>
-                  <div className="bg-white shadow-sm p-1.5 rounded-md group-hover:text-primary transition-colors">
-                    <Copy className="h-3.5 w-3.5" />
-                  </div>
-                </button>
-
-                {paymentInfo?.minDeposit ? (
-                  <div className="mt-5 px-3 py-1.5 bg-primary/5 text-primary text-xs font-semibold rounded-full">
-                    Minimum deposit: ₹{paymentInfo.minDeposit}
-                  </div>
-                ) : null}
-              </div>
-
-              {/* UTR Input Section */}
-              <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-                <div className="space-y-2">
-                  <label htmlFor="utr" className="text-sm font-bold text-foreground pl-1">
-                    Enter Reference Number
-                  </label>
-                  <div className="relative">
-                    <Input
-                      id="utr"
-                      type="text"
-                      placeholder="e.g. 312345678901"
-                      value={utr}
-                      onChange={(e) => setUtr(e.target.value)}
-                      className="utr-input h-16 text-lg pl-5 pr-12 shadow-sm"
-                      data-testid="input-utr"
-                    />
-                    <div className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground">
-                      <ShieldCheck className="h-5 w-5" />
+              {!depositSession ? (
+                <Card className="p-6 border-2 border-primary/15 shadow-sm">
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="h-10 w-10 rounded-2xl bg-primary/10 text-primary flex items-center justify-center">
+                      <Wallet className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <h2 className="font-bold text-foreground">Enter deposit amount</h2>
+                      <p className="text-xs text-muted-foreground">You will get a unique QR for this payment.</p>
                     </div>
                   </div>
-                  <p className="text-[11px] text-muted-foreground pl-1 font-medium">
-                    Enter the 12-digit UTR / Transaction ID from your UPI app.
-                  </p>
-                </div>
+                  <form onSubmit={handleCreateDeposit} className="flex flex-col gap-3 mt-5">
+                    <div className="relative">
+                      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground font-bold">₹</span>
+                      <Input
+                        type="number"
+                        min={paymentInfo?.minDeposit ?? 1}
+                        step="0.01"
+                        placeholder="Enter amount"
+                        value={amountInr}
+                        onChange={(e) => setAmountInr(e.target.value)}
+                        className="h-14 text-lg pl-9 shadow-sm"
+                        data-testid="input-deposit-amount"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Minimum deposit: ₹{paymentInfo?.minDeposit ?? 1}. Your balance is updated automatically after payment verification.
+                    </p>
+                    <Button
+                      type="submit"
+                      size="lg"
+                      className="w-full"
+                      disabled={!amountInr || isPaymentInfoLoading || createSessionMutation.isPending || isMissingUserId}
+                      data-testid="button-create-deposit"
+                    >
+                      {createSessionMutation.isPending ? 'Preparing secure QR...' : 'Generate UPI QR'}
+                      <ArrowRight className="ml-2 h-4 w-4" />
+                    </Button>
+                  </form>
+                </Card>
+              ) : (
+                <>
+                  <div className="bg-white dark:bg-card border rounded-3xl p-6 shadow-sm flex flex-col items-center text-center relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary via-purple-400 to-primary"></div>
+                    <h2 className="text-sm font-bold text-muted-foreground uppercase tracking-wider mb-5 flex items-center gap-2">
+                      <QrCode className="h-4 w-4" />
+                      Scan to Pay ₹{depositSession.amountInr.toFixed(2)}
+                    </h2>
+                    <div className="qr-container bg-white p-2 rounded-2xl mb-5 relative">
+                      <img
+                        src={depositSession.qrImageUrl}
+                        alt="UPI QR Code"
+                        className="w-56 h-56 object-cover rounded-xl"
+                      />
+                      <div className="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-primary rounded-tl-xl" />
+                      <div className="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-primary rounded-tr-xl" />
+                      <div className="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-primary rounded-bl-xl" />
+                      <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-primary rounded-br-xl" />
+                    </div>
+                    <p className="text-sm text-muted-foreground mb-2">Pay to this UPI ID:</p>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(depositSession.upiId);
+                        toast({ title: "UPI ID copied", description: "Paste it in your UPI app if needed." });
+                      }}
+                      className="flex items-center gap-3 bg-secondary/50 hover:bg-secondary px-4 py-2.5 rounded-xl transition-colors active:scale-95 group"
+                      data-testid="button-copy-upi"
+                    >
+                      <span className="font-semibold text-foreground tracking-wide">{depositSession.upiId}</span>
+                      <div className="bg-white shadow-sm p-1.5 rounded-md group-hover:text-primary transition-colors">
+                        <Copy className="h-3.5 w-3.5" />
+                      </div>
+                    </button>
+                    <a href={depositSession.upiLink} className="mt-4 w-full">
+                      <Button type="button" size="lg" className="w-full">
+                        Open UPI App & Pay
+                        <ArrowRight className="ml-2 h-4 w-4" />
+                      </Button>
+                    </a>
+                    <div className="mt-4 px-3 py-1.5 bg-primary/5 text-primary text-xs font-semibold rounded-full">
+                      Payment is being checked automatically
+                    </div>
+                    {sessionStatus?.status === 'expired' && (
+                      <p className="mt-3 text-xs font-semibold text-destructive">This QR expired. Start a new deposit.</p>
+                    )}
+                    {sessionStatus?.status === 'failed' && (
+                      <p className="mt-3 text-xs font-semibold text-destructive">{sessionStatus.error || 'Verification failed.'}</p>
+                    )}
+                  </div>
 
-                <Button 
-                  type="submit" 
-                  size="lg" 
-                  className="w-full text-base group mt-2"
-                  disabled={!utr || isMissingUserId || isPaymentInfoLoading}
-                  data-testid="button-submit-utr"
-                >
-                  Verify & Add Balance
-                  <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
-                </Button>
-              </form>
+                  {/* Manual fallback if the gateway does not detect the payment automatically. */}
+                  <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+                    <div className="space-y-2">
+                      <label htmlFor="utr" className="text-sm font-bold text-foreground pl-1">
+                        Payment not detected? Enter UTR
+                      </label>
+                      <div className="relative">
+                        <Input
+                          id="utr"
+                          type="text"
+                          placeholder="e.g. 312345678901"
+                          value={utr}
+                          onChange={(e) => setUtr(e.target.value)}
+                          className="utr-input h-16 text-lg pl-5 pr-12 shadow-sm"
+                          data-testid="input-utr"
+                        />
+                        <div className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground">
+                          <ShieldCheck className="h-5 w-5" />
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-muted-foreground pl-1 font-medium">
+                        Optional fallback: enter the UTR from your UPI app if automatic detection takes too long.
+                      </p>
+                    </div>
+                    <Button
+                      type="submit"
+                      size="lg"
+                      className="w-full text-base group mt-2"
+                      disabled={!utr || isMissingUserId || verifyMutation.isPending}
+                      data-testid="button-submit-utr"
+                    >
+                      {verifyMutation.isPending ? 'Verifying...' : 'Verify UTR & Add Balance'}
+                      <ArrowRight className="ml-2 h-4 w-4 group-hover:translate-x-1 transition-transform" />
+                    </Button>
+                  </form>
+                </>
+              )}
 
               {/* How it works */}
               <div className="mt-4 pt-6 border-t flex items-center justify-between px-2 text-center text-xs font-medium text-muted-foreground">

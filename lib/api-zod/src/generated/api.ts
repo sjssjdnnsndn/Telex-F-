@@ -113,3 +113,46 @@ export const VerifyUtrResponse = zod.object({
 })
 
 
+/**
+ * Creates a unique order and UPI deep link that the mini app can monitor for automatic payment verification.
+ * @summary Create an amount-specific UPI deposit session
+ */
+
+
+
+export const CreateDepositSessionBody = zod.object({
+  "amountInr": zod.number().min(1)
+})
+
+export const CreateDepositSessionResponse = zod.object({
+  "orderId": zod.string(),
+  "amountInr": zod.number(),
+  "amountUsd": zod.number(),
+  "upiId": zod.string(),
+  "upiLink": zod.string(),
+  "qrImageUrl": zod.string(),
+  "status": zod.enum(['pending']),
+  "expiresAt": zod.string()
+})
+
+
+/**
+ * @summary Get the live status of a UPI deposit session
+ */
+export const GetDepositSessionParams = zod.object({
+  "orderId": zod.coerce.string()
+})
+
+export const GetDepositSessionResponse = zod.object({
+  "orderId": zod.string(),
+  "status": zod.enum(['pending', 'paid', 'expired', 'failed']),
+  "amountInr": zod.number(),
+  "amountUsd": zod.number(),
+  "newBalance": zod.number().optional(),
+  "utr": zod.string().optional(),
+  "ref": zod.string().optional(),
+  "date": zod.string().optional(),
+  "error": zod.string().optional()
+})
+
+

@@ -22,6 +22,9 @@ import type {
 import type {
   AdminCheckResult,
   BalanceInfo,
+  CreateDepositSessionInput,
+  DepositSession,
+  DepositSessionStatus,
   HealthStatus,
   PaymentInfo,
   UpdatePaymentInfoInput,
@@ -131,12 +134,6 @@ export function useHealthCheck<TData = Awaited<ReturnType<typeof healthCheck>>, 
   return withQueryKey(query, queryOptions.queryKey);
 }
 
-
-
-
-
-
-
 export const getGetPaymentInfoUrl = () => {
 
 
@@ -208,13 +205,6 @@ export function useGetPaymentInfo<TData = Awaited<ReturnType<typeof getPaymentIn
 
   return withQueryKey(query, queryOptions.queryKey);
 }
-
-
-
-
-
-
-
 export const getGetUpiBalanceUrl = (telegramUserId: number,) => {
 
 
@@ -285,13 +275,6 @@ export function useGetUpiBalance<TData = Awaited<ReturnType<typeof getUpiBalance
 
   return withQueryKey(query, queryOptions.queryKey);
 }
-
-
-
-
-
-
-
 export const getCheckAdminUrl = () => {
 
 
@@ -583,4 +566,153 @@ export const useVerifyUtr = <TError = ErrorType<UpiError>,
       > => {
       return useMutation(getVerifyUtrMutationOptions(options));
     }
+
+export const getCreateDepositSessionUrl = () => {
+
+
+
+
+  return `/api/upi/deposit-session`
+}
+
+/**
+ * Creates a unique order and UPI deep link that the mini app can monitor for automatic payment verification.
+ * @summary Create an amount-specific UPI deposit session
+ */
+export const createDepositSession = async (createDepositSessionInput: CreateDepositSessionInput, options?: Parameters<typeof customFetch>[1]): Promise<DepositSession> => {
+
+  return customFetch<DepositSession>(getCreateDepositSessionUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(createDepositSessionInput)
+  }
+);}
+
+
+
+
+
+export const getCreateDepositSessionMutationOptions = <TError = ErrorType<UpiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createDepositSession>>, TError,{data: BodyType<CreateDepositSessionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createDepositSession>>, TError,{data: BodyType<CreateDepositSessionInput>}, TContext> => {
+
+const mutationKey = ['createDepositSession'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createDepositSession>>, {data: BodyType<CreateDepositSessionInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  createDepositSession(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateDepositSessionMutationResult = NonNullable<Awaited<ReturnType<typeof createDepositSession>>>
+    export type CreateDepositSessionMutationBody = BodyType<CreateDepositSessionInput>
+    export type CreateDepositSessionMutationError = ErrorType<UpiError>
+
+    /**
+ * @summary Create an amount-specific UPI deposit session
+ */
+export const useCreateDepositSession = <TError = ErrorType<UpiError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createDepositSession>>, TError,{data: BodyType<CreateDepositSessionInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof createDepositSession>>,
+        TError,
+        {data: BodyType<CreateDepositSessionInput>},
+        TContext
+      > => {
+      return useMutation(getCreateDepositSessionMutationOptions(options));
+    }
+
+export const getGetDepositSessionUrl = (orderId: string,) => {
+
+
+
+
+  return `/api/upi/deposit-session/${orderId}`
+}
+
+/**
+ * @summary Get the live status of a UPI deposit session
+ */
+export const getDepositSession = async (orderId: string, options?: Parameters<typeof customFetch>[1]): Promise<DepositSessionStatus> => {
+
+  return customFetch<DepositSessionStatus>(getGetDepositSessionUrl(orderId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetDepositSessionQueryKey = (orderId: string,) => {
+    return [
+    `/api/upi/deposit-session/${orderId}`
+    ] as const;
+    }
+
+
+export const getGetDepositSessionQueryOptions = <TData = Awaited<ReturnType<typeof getDepositSession>>, TError = ErrorType<UpiError>>(orderId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getDepositSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetDepositSessionQueryKey(orderId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getDepositSession>>> = ({ signal }) => getDepositSession(orderId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: orderId !== null && orderId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getDepositSession>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetDepositSessionQueryResult = NonNullable<Awaited<ReturnType<typeof getDepositSession>>>
+export type GetDepositSessionQueryError = ErrorType<UpiError>
+
+
+/**
+ * @summary Get the live status of a UPI deposit session
+ */
+
+export function useGetDepositSession<TData = Awaited<ReturnType<typeof getDepositSession>>, TError = ErrorType<UpiError>>(
+ orderId: string, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getDepositSession>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetDepositSessionQueryOptions(orderId,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 

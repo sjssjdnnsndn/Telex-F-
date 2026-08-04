@@ -8,6 +8,11 @@
 
 export * from './adminCheckResult';
 export * from './balanceInfo';
+export * from './createDepositSessionInput';
+export * from './depositSession';
+export * from './depositSessionStatus';
+export * from './depositSessionStatusProperty';
+export * from './depositSessionStatusStatus';
 export * from './healthStatus';
 export * from './paymentInfo';
 export * from './updatePaymentInfoInput';

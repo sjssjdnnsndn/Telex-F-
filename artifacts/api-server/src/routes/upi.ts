@@ -10,15 +10,27 @@ import {
   UpdatePaymentInfoResponse,
   VerifyDeviceBody,
   VerifyDeviceResponse,
+  CreateDepositSessionBody,
+  CreateDepositSessionResponse,
+  GetDepositSessionParams,
+  GetDepositSessionResponse,
 } from "@workspace/api-zod";
 import {
   getPaymentSettings,
   setPaymentSettings,
   getOrCreateUser,
   verifyAndBindDevice,
+  getConfiguredMerchantId,
+  getConfiguredUpiId,
+  getDepositSessionsCollection,
+  getDepositSession,
 } from "../lib/mongo";
 import { notifyUserOfDeviceVerification } from "../lib/bot";
-import { verifyAndCredit } from "../lib/depositLogic";
+import {
+  verifyAndCredit,
+  monitorDepositSession,
+  getDepositSessionStatus,
+} from "../lib/depositLogic";
 import { notifyAdminOfDeposit } from "../lib/bot";
 import { verifyTelegramInitData } from "../lib/telegramAuth";
 
@@ -57,9 +69,10 @@ function requireVerifiedTelegramUser(
 
 router.get("/upi/payment-info", async (_req, res): Promise<void> => {
   const settings = await getPaymentSettings();
+  const configuredUpiId = await getConfiguredUpiId();
   res.json(
     GetPaymentInfoResponse.parse({
-      upiId: settings.upiId,
+      upiId: configuredUpiId,
       qrImageUrl: settings.qrImageUrl,
       minDeposit: settings.minDeposit,
     }),
@@ -188,6 +201,108 @@ router.post("/upi/verify", async (req, res): Promise<void> => {
       date: result.date,
     }),
   );
+});
+
+router.post("/upi/deposit-session", async (req, res): Promise<void> => {
+  const verifiedUserId = requireVerifiedTelegramUser(req, res);
+  if (verifiedUserId === null) return;
+
+  const parsed = CreateDepositSessionBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const settings = await getPaymentSettings();
+  const upiId = await getConfiguredUpiId();
+  const merchantId = await getConfiguredMerchantId();
+  if (!merchantId || !upiId || upiId === "yourupi@bank") {
+    res.status(400).json({
+      error: "Automatic UPI verification is not configured. Admin must set the UPI ID and MID first.",
+    });
+    return;
+  }
+  if (parsed.data.amountInr < settings.minDeposit) {
+    res.status(400).json({ error: `Minimum deposit is ₹${settings.minDeposit}.` });
+    return;
+  }
+
+  const orderId = `UPI${verifiedUserId}${Date.now()}`;
+  const amountInr = Number(parsed.data.amountInr.toFixed(2));
+  const amountUsd = amountInr / Number(process.env["USD_TO_INR_RATE"] ?? "96");
+  const params = new URLSearchParams({
+    pa: upiId,
+    pn: "TelegramBot",
+    am: amountInr.toFixed(2),
+    cu: "INR",
+    tn: orderId,
+    tr: orderId,
+  });
+  const upiLink = `upi://pay?${params.toString()}`;
+  const qrImageUrl = `https://quickchart.io/qr?size=420&margin=2&text=${encodeURIComponent(upiLink)}`;
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  const sessions = await getDepositSessionsCollection();
+  await sessions.insertOne({
+    orderId,
+    telegramUserId: verifiedUserId,
+    amountInr,
+    amountUsd,
+    upiId,
+    upiLink,
+    status: "pending",
+    createdAt: new Date(),
+    expiresAt,
+  });
+
+  // The API process owns this monitor. It uses the merchant id server-side and
+  // never exposes it to the Telegram WebApp.
+  void monitorDepositSession(orderId, merchantId);
+
+  res.status(201).json(
+    CreateDepositSessionResponse.parse({
+      orderId,
+      amountInr,
+      amountUsd,
+      upiId,
+      upiLink,
+      qrImageUrl,
+      status: "pending",
+      expiresAt: expiresAt.toISOString(),
+    }),
+  );
+});
+
+router.get("/upi/deposit-session/:orderId", async (req, res): Promise<void> => {
+  const verifiedUserId = requireVerifiedTelegramUser(req, res);
+  if (verifiedUserId === null) return;
+
+  const parsed = GetDepositSessionParams.safeParse(req.params);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+  const session = await getDepositSession(parsed.data.orderId);
+  if (!session) {
+    res.status(404).json({ error: "Deposit session not found." });
+    return;
+  }
+  if (session.telegramUserId !== verifiedUserId) {
+    res.status(403).json({ error: "You can only view your own deposit session." });
+    return;
+  }
+
+  const status = await getDepositSessionStatus(session.orderId);
+  if (!status) {
+    res.status(404).json({ error: "Deposit session not found." });
+    return;
+  }
+  if (status.status === "pending") {
+    const merchantId = await getConfiguredMerchantId();
+    if (merchantId) {
+      void monitorDepositSession(session.orderId, merchantId);
+    }
+  }
+  res.json(GetDepositSessionResponse.parse(status));
 });
 
 export default router;

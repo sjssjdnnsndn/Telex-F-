@@ -72,3 +72,48 @@ export interface VerifyDeviceResult {
   reason: VerifyDeviceResultReason;
 }
 
+export interface CreateDepositSessionInput {
+  /** @minimum 1 */
+  amountInr: number;
+}
+
+export type DepositSessionStatusProperty = typeof DepositSessionStatusProperty[keyof typeof DepositSessionStatusProperty];
+
+
+export const DepositSessionStatusProperty = {
+  pending: 'pending',
+} as const;
+
+export interface DepositSession {
+  orderId: string;
+  amountInr: number;
+  amountUsd: number;
+  upiId: string;
+  upiLink: string;
+  qrImageUrl: string;
+  status: DepositSessionStatusProperty;
+  expiresAt: string;
+}
+
+export type DepositSessionStatusStatus = typeof DepositSessionStatusStatus[keyof typeof DepositSessionStatusStatus];
+
+
+export const DepositSessionStatusStatus = {
+  pending: 'pending',
+  paid: 'paid',
+  expired: 'expired',
+  failed: 'failed',
+} as const;
+
+export interface DepositSessionStatus {
+  orderId: string;
+  status: DepositSessionStatusStatus;
+  amountInr: number;
+  amountUsd: number;
+  newBalance?: number;
+  utr?: string;
+  ref?: string;
+  date?: string;
+  error?: string;
+}
+

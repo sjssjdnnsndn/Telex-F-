@@ -35,6 +35,12 @@ export async function getDb(): Promise<Db> {
         .catch((err) => {
           logger.error({ err }, "Failed to create unique index on device_fingerprints.fingerprint");
         }),
+      db
+        .collection("upi_deposit_sessions")
+        .createIndex({ orderId: 1 }, { unique: true })
+        .catch((err) => {
+          logger.error({ err }, "Failed to create unique index on upi_deposit_sessions.orderId");
+        }),
     ]).then(() => undefined);
   }
   await indexesReady;
@@ -75,6 +81,26 @@ export interface UsedUtr {
   createdAt: Date;
 }
 
+export type DepositSessionStatus = "pending" | "paid" | "expired" | "failed";
+
+export interface DepositSession {
+  orderId: string;
+  telegramUserId: number;
+  amountInr: number;
+  amountUsd: number;
+  upiId: string;
+  upiLink: string;
+  status: DepositSessionStatus;
+  createdAt: Date;
+  expiresAt: Date;
+  actualAmountInr?: number;
+  utr?: string;
+  ref?: string;
+  date?: string;
+  newBalance?: number;
+  error?: string;
+}
+
 export async function getPaymentSettingsCollection(): Promise<
   Collection<PaymentSettings>
 > {
@@ -90,6 +116,29 @@ export async function getUsersCollection(): Promise<Collection<UserBalance>> {
 export async function getUsedUtrsCollection(): Promise<Collection<UsedUtr>> {
   const database = await getDb();
   return database.collection<UsedUtr>("used_utrs");
+}
+
+export async function getDepositSessionsCollection(): Promise<Collection<DepositSession>> {
+  const database = await getDb();
+  return database.collection<DepositSession>("upi_deposit_sessions");
+}
+
+export async function getDepositSession(orderId: string): Promise<DepositSession | null> {
+  const sessions = await getDepositSessionsCollection();
+  return sessions.findOne({ orderId });
+}
+
+export async function getConfiguredUpiId(): Promise<string> {
+  const database = await getDb();
+  const legacy = await database.collection<{ key: string; value?: string }>("config").findOne({ key: "upi_id" });
+  if (legacy?.value?.trim()) return legacy.value.trim();
+  return (await getPaymentSettings()).upiId;
+}
+
+export async function getConfiguredMerchantId(): Promise<string | null> {
+  const database = await getDb();
+  const legacy = await database.collection<{ key: string; value?: string }>("config").findOne({ key: "mid" });
+  return legacy?.value?.trim() || null;
 }
 
 /**
@@ -140,6 +189,14 @@ export async function setPaymentSettings(
     { $set: update, $setOnInsert: setOnInsert },
     { upsert: true },
   );
+  if (update.upiId) {
+    const database = await getDb();
+    await database.collection("config").updateOne(
+      { key: "upi_id" },
+      { $set: { value: update.upiId, updated_at: new Date() }, $setOnInsert: { created_at: new Date() } },
+      { upsert: true },
+    );
+  }
   return getPaymentSettings();
 }
 

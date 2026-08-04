@@ -1377,7 +1377,7 @@ async def deposit_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("💰 Crypto", callback_data="deposit_crypto_list")],
-        [InlineKeyboardButton("🇮🇳 UPI (India)", callback_data="deposit_upi")],
+        [InlineKeyboardButton("🇮🇳 UPI Deposit — Open Mini App", web_app=WebAppInfo(url=MINI_APP_URL))],
         [InlineKeyboardButton("◀️ Back", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1435,18 +1435,18 @@ async def show_user_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Callback handlers for deposits
 async def handle_upi_deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Opens the UPI deposit Mini App: scan QR, pay any amount, paste UTR, balance credited instantly."""
+    """Opens the UPI deposit Mini App for automatic QR payment verification."""
     query = update.callback_query
     await query.answer()
 
     await query.message.edit_text(
         f"🇮🇳 <b>UPI Deposit</b>\n\n"
         f"Minimum: ₹{MIN_DEPOSIT_INR:.0f} INR\n\n"
-        f"Tap below to open the deposit page. Scan the QR, pay any amount via any UPI app, "
-        f"then paste your UTR/transaction ID there — your balance is credited instantly.",
+        f"Tap below to open the deposit page. Enter an amount, scan the unique QR, "
+        f"and pay. The merchant gateway will verify the payment automatically and update your balance.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Open UPI Deposit", web_app=WebAppInfo(url=MINI_APP_URL))],
+            [InlineKeyboardButton("💳 Open UPI Deposit Mini App", web_app=WebAppInfo(url=MINI_APP_URL))],
         ]),
     )
 

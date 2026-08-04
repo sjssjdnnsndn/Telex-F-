@@ -163,6 +163,73 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UpiError"
+  /upi/deposit-session:
+    post:
+      operationId: createDepositSession
+      tags: [upi]
+      summary: Create an amount-specific UPI deposit session
+      description: Creates a unique order and UPI deep link that the mini app can monitor for automatic payment verification.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDepositSessionInput"
+      responses:
+        "201":
+          description: Deposit session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepositSession"
+        "400":
+          description: UPI automatic verification is not configured or amount is invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+        "401":
+          description: Missing or invalid Telegram authentication
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+  /upi/deposit-session/{orderId}:
+    get:
+      operationId: getDepositSession
+      tags: [upi]
+      summary: Get the live status of a UPI deposit session
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deposit session status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepositSessionStatus"
+        "401":
+          description: Missing or invalid Telegram authentication
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+        "403":
+          description: Session belongs to another Telegram user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpiError"
 components:
   schemas:
     HealthStatus:
@@ -280,4 +347,68 @@ components:
       required:
         - verified
         - reason
+    CreateDepositSessionInput:
+      type: object
+      properties:
+        amountInr:
+          type: number
+          minimum: 1
+      required:
+        - amountInr
+    DepositSession:
+      type: object
+      properties:
+        orderId:
+          type: string
+        amountInr:
+          type: number
+        amountUsd:
+          type: number
+        upiId:
+          type: string
+        upiLink:
+          type: string
+        qrImageUrl:
+          type: string
+        status:
+          type: string
+          enum: [pending]
+        expiresAt:
+          type: string
+      required:
+        - orderId
+        - amountInr
+        - amountUsd
+        - upiId
+        - upiLink
+        - qrImageUrl
+        - status
+        - expiresAt
+    DepositSessionStatus:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+          enum: [pending, paid, expired, failed]
+        amountInr:
+          type: number
+        amountUsd:
+          type: number
+        newBalance:
+          type: number
+        utr:
+          type: string
+        ref:
+          type: string
+        date:
+          type: string
+        error:
+          type: string
+      required:
+        - orderId
+        - status
+        - amountInr
+        - amountUsd
 
