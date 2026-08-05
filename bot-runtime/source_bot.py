@@ -12,6 +12,7 @@ from io import BytesIO
 import random
 import string
 import sys
+from functools import wraps
 from pathlib import Path
 
 RUNTIME_DIR = Path(__file__).resolve().parent
@@ -146,6 +147,8 @@ SUPPORT_CHAT: Dict[int, bool] = {}
 LAST_INLINE_MSG: Dict[int, int] = {}  # user_id -> message_id of last inline-keyboard bot message
 OTP_WATCHERS: Dict[int, Tuple[TelegramClient, object]] = {}
 BULK_OTP_WATCHERS: Dict[str, Tuple[TelegramClient, object]] = {}
+ACTIVE_USER_TASKS: Dict[int, set] = {}
+SALE_FINALIZING_USERS: set[int] = set()
 
 # Simple state storage
 USER_STATES = {}
@@ -777,6 +780,235 @@ def update_data(user_id: int, **kwargs):
 
 def get_data(user_id: int):
     return USER_DATA.get(user_id, {})
+
+
+async def close_user_telethon_watchers(user_id: int) -> None:
+    """Close every OTP watcher owned by one user."""
+    watcher = OTP_WATCHERS.pop(user_id, None)
+    if watcher:
+        await close_telethon_client(watcher[0], watcher[1], log_out=False)
+
+    watcher_keys = [
+        key for key in BULK_OTP_WATCHERS
+        if key.startswith(f"{user_id}_")
+    ]
+    for watcher_key in watcher_keys:
+        watcher = BULK_OTP_WATCHERS.pop(watcher_key, None)
+        if watcher:
+            await close_telethon_client(watcher[0], watcher[1], log_out=False)
+
+
+async def cancel_user_flow(
+    user_id: int,
+    *,
+    keep_data: bool = False,
+    exclude_task: Optional[asyncio.Task] = None,
+) -> None:
+    """Stop prior work before a user starts a different bot flow.
+
+    python-telegram-bot normally processes updates serially. We intentionally
+    run updates concurrently so a new button can be handled immediately, then
+    cancel older update tasks and close their Telethon watchers here.
+    """
+    current_task = exclude_task or asyncio.current_task()
+    for task in list(ACTIVE_USER_TASKS.get(user_id, set())):
+        if task is current_task or task.done():
+            continue
+        task.cancel()
+
+    if user_id not in SALE_FINALIZING_USERS:
+        await close_user_telethon_watchers(user_id)
+    if keep_data:
+        clear_state_only(user_id)
+    else:
+        clear_state(user_id)
+
+
+async def run_cancellation_safe(coro, *, on_cancel=None):
+    """Finish a money/account mutation even if a new button cancels its caller."""
+    operation = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        # The caller is cancelled so the next update can run immediately, but
+        # this critical operation must finish before its task exits.
+        try:
+            result = await operation
+            if on_cancel:
+                await on_cancel(result)
+        finally:
+            raise
+
+
+async def finalize_sold_account_logout(
+    user_id: int,
+    *,
+    session_string: Optional[str] = None,
+    watcher: Optional[Tuple[TelegramClient, object]] = None,
+) -> bool:
+    """Finish the seller-session logout even if the caller is cancelled."""
+    SALE_FINALIZING_USERS.add(user_id)
+    try:
+        if watcher:
+            client, handler = watcher
+            return await run_cancellation_safe(
+                close_telethon_client(client, handler, log_out=True)
+            )
+        return await run_cancellation_safe(
+            logout_sold_account_session(session_string=session_string)
+        )
+    finally:
+        SALE_FINALIZING_USERS.discard(user_id)
+
+
+async def run_sale_operation(user_id: int, operation):
+    """Run a purchase commit and its seller-session logout as one unit."""
+    SALE_FINALIZING_USERS.add(user_id)
+    try:
+        return await run_cancellation_safe(operation)
+    finally:
+        SALE_FINALIZING_USERS.discard(user_id)
+
+
+def _bulk_expected_account_id(user_id: int) -> Optional[int]:
+    data = get_data(user_id)
+    ids = data.get("bb_otp_ids", [])
+    idx = data.get("bb_otp_idx", 0)
+    if not isinstance(idx, int) or idx < 0 or idx >= len(ids):
+        return None
+    try:
+        return int(ids[idx])
+    except (TypeError, ValueError):
+        return None
+
+
+def _callback_matches_current_flow(user_id: int, callback_data: str) -> bool:
+    """Validate that a continuation button belongs to the current step."""
+    data = get_data(user_id)
+    if callback_data.startswith("bb_next_"):
+        try:
+            return int(callback_data.replace("bb_next_", "", 1)) == int(
+                data.get("bb_otp_idx")
+            )
+        except (TypeError, ValueError):
+            return False
+    if callback_data.startswith(("login_done_", "login_2fa_", "back_to_login_")):
+        try:
+            return int(callback_data.rsplit("_", 1)[1]) == int(data.get("acc_id"))
+        except (TypeError, ValueError):
+            return False
+
+    if callback_data.startswith(("bb_done_", "bb_2fa_", "bb_back_login_")):
+        try:
+            return int(callback_data.rsplit("_", 1)[1]) == _bulk_expected_account_id(user_id)
+        except (TypeError, ValueError):
+            return False
+
+    return True
+
+
+def _callback_continues_current_flow(user_id: int, callback_data: str) -> bool:
+    """Return True only for buttons belonging to the active flow."""
+    state = get_state(user_id)
+    if state == "waiting_for_login_done" and callback_data.startswith(
+        ("login_done_", "login_2fa_", "back_to_login_")
+    ):
+        return _callback_matches_current_flow(user_id, callback_data)
+    if state == "bulk_otp_delivery" and (
+        callback_data.startswith("bb_next_")
+        or callback_data.startswith(("bb_done_", "bb_2fa_", "bb_back_login_"))
+    ):
+        return _callback_matches_current_flow(user_id, callback_data)
+    if state == "add_bulk_confirm" and callback_data.startswith("ba_mode_"):
+        return True
+    if state == "add_balance_currency" and callback_data.startswith("currency_"):
+        return True
+    return False
+
+
+def _callback_is_stale_continuation(user_id: int, callback_data: str) -> bool:
+    """Detect old flow buttons so they cannot cancel a newer flow."""
+    state = get_state(user_id)
+    if callback_data.startswith(("login_done_", "login_2fa_", "back_to_login_")):
+        return (
+            state != "waiting_for_login_done"
+            or not _callback_matches_current_flow(user_id, callback_data)
+        )
+    if callback_data.startswith("bb_next_") or callback_data.startswith(
+        ("bb_done_", "bb_2fa_", "bb_back_login_")
+    ):
+        return (
+            state != "bulk_otp_delivery"
+            or (
+                callback_data.startswith("bb_next_")
+                and callback_data != f"bb_next_{get_data(user_id).get('bb_otp_idx', 0)}"
+            )
+            or (
+                not callback_data.startswith("bb_next_")
+                and not _callback_matches_current_flow(user_id, callback_data)
+            )
+        )
+    if callback_data.startswith("ba_mode_"):
+        return state != "add_bulk_confirm"
+    if callback_data.startswith("currency_"):
+        return state != "add_balance_currency"
+    return False
+
+
+async def prepare_callback_flow(update: Update) -> bool:
+    """Cancel stale work before dispatching a new callback action."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return True
+
+    callback_data = query.data or ""
+    user_id = update.effective_user.id
+    if _callback_continues_current_flow(user_id, callback_data):
+        return True
+    if _callback_is_stale_continuation(user_id, callback_data):
+        await query.answer("This button is no longer active.", show_alert=True)
+        return False
+
+    # These callbacks need the existing bulk selection data, but must still
+    # stop any unrelated state or active watcher before taking over.
+    keep_data = callback_data.startswith(("bb_", "ba_mode_", "currency_"))
+    await cancel_user_flow(
+        user_id,
+        keep_data=keep_data and callback_data != "bb_cancel",
+    )
+    return True
+
+
+def tracked_user_handler(handler, *, callback: bool = False):
+    """Track update tasks so a later action can cancel the previous one."""
+    @wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        user_id = user.id if user else None
+        task = asyncio.current_task()
+        if user_id is not None and task is not None:
+            ACTIVE_USER_TASKS.setdefault(user_id, set()).add(task)
+        try:
+            if callback:
+                should_dispatch = await prepare_callback_flow(update)
+                if not should_dispatch:
+                    return
+            elif (
+                update.message
+                and update.message.text in MAIN_MENU_BUTTON_TEXTS
+            ):
+                await cancel_user_flow(user_id, exclude_task=task)
+            return await handler(update, context)
+        finally:
+            if user_id is not None and task is not None:
+                tasks = ACTIVE_USER_TASKS.get(user_id)
+                if tasks:
+                    tasks.discard(task)
+                    if not tasks:
+                        ACTIVE_USER_TASKS.pop(user_id, None)
+
+    return wrapped
+
 
 def should_cancel_state(update: Update) -> bool:
     """Check if we should cancel current state"""
@@ -1942,37 +2174,48 @@ async def handle_session_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 pass
     
-    # Process purchase
-    new_balance = user.get("balance", 0) - discounted_price
-    await db.users.update_one(
-        {"id": user_id},
-        {
-            "$set": {"balance": new_balance},
-            "$inc": {"purchases": 1}
-        }
+    async def commit_session_purchase():
+        new_balance = user.get("balance", 0) - discounted_price
+        await db.users.update_one(
+            {"id": user_id},
+            {
+                "$set": {"balance": new_balance},
+                "$inc": {"purchases": 1}
+            }
+        )
+
+        await db.accounts.update_one(
+            {"id": account_id},
+            {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
+        )
+
+        if user.get("referred_by"):
+            await award_referral_commission(user["referred_by"], user_id, discounted_price)
+
+        await db.transactions.insert_one({
+            "user_id": user_id,
+            "type": "account_purchase",
+            "account_id": account_id,
+            "amount": discounted_price,
+            "original_price": price_usd,
+            "discount": savings,
+            "timestamp": datetime.now()
+        })
+        return new_balance
+
+    async def complete_session_sale():
+        new_balance = await commit_session_purchase()
+        logged_out = await finalize_sold_account_logout(
+            user_id,
+            session_string=account.get("session"),
+        )
+        return new_balance, logged_out
+
+    # Keep commit and seller-session logout in one cancellation-safe operation.
+    new_balance, logged_out = await run_sale_operation(
+        user_id,
+        complete_session_sale(),
     )
-    
-    # Mark account as sold
-    await db.accounts.update_one(
-        {"id": account_id},
-        {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
-    )
-    
-    # Award referral commission if user was referred
-    if user.get("referred_by"):
-        referrer_id = user["referred_by"]
-        await award_referral_commission(referrer_id, user_id, discounted_price)
-    
-    # Record transaction
-    await db.transactions.insert_one({
-        "user_id": user_id,
-        "type": "account_purchase",
-        "account_id": account_id,
-        "amount": discounted_price,
-        "original_price": price_usd,
-        "discount": savings,
-        "timestamp": datetime.now()
-    })
     
     # Send account details
     message = (
@@ -2009,8 +2252,7 @@ async def handle_session_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.HTML
         )
     
-    # Log the bot out of this account's session, then tell the buyer and ask for a rating
-    logged_out = await logout_sold_account_session(session_string=account.get("session"))
+    # The session was already logged out before user-facing delivery began.
     await send_sale_logout_notice_and_rating(context, user_id, account_id, logged_out)
 
 async def send_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2172,7 +2414,7 @@ async def login_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    try:
+    async def commit_otp_purchase():
         new_balance = user.get("balance", 0) - discounted_price
         await db.users.update_one(
             {"id": user_id},
@@ -2198,20 +2440,29 @@ async def login_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "discount": savings,
             "timestamp": datetime.now()
         })
-    except Exception:
-        OTP_WATCHERS.pop(user_id, None)
-        if telethon_client:
-            await close_telethon_client(telethon_client, handler, log_out=False)
-        raise
-    
-    # Log the bot out of this account's session after delivery.
-    logged_out = False
-    if telethon_client:
-        OTP_WATCHERS.pop(user_id, None)
-        logged_out = await close_telethon_client(telethon_client, handler, log_out=True)
-    else:
-        # No live client from the OTP flow (e.g. bot restarted mid-flow) — log out using the stored session instead
-        logged_out = await logout_sold_account_session(session_string=account.get("session"))
+
+        return new_balance
+
+    async def complete_otp_sale():
+        new_balance = await commit_otp_purchase()
+        current_watcher = OTP_WATCHERS.get(user_id)
+        if current_watcher:
+            logged_out = await finalize_sold_account_logout(
+                user_id,
+                watcher=current_watcher,
+            )
+            OTP_WATCHERS.pop(user_id, None)
+        else:
+            logged_out = await finalize_sold_account_logout(
+                user_id,
+                session_string=account.get("session"),
+            )
+        return new_balance, logged_out
+
+    new_balance, logged_out = await run_sale_operation(
+        user_id,
+        complete_otp_sale(),
+    )
     
     # Send success message
     message = (
@@ -2324,17 +2575,7 @@ async def bulk_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Cancel ──────────────────────────────────────────────────────────────
     if data == "bb_cancel":
-        # Stop Here/Cancel can be pressed while a bulk OTP watcher is active.
-        # Close every watcher owned by this user before clearing the flow.
-        watcher_keys = [
-            key for key in BULK_OTP_WATCHERS
-            if key.startswith(f"{user_id}_")
-        ]
-        for watcher_key in watcher_keys:
-            watcher = BULK_OTP_WATCHERS.pop(watcher_key, None)
-            if watcher:
-                await close_telethon_client(watcher[0], watcher[1], log_out=False)
-        clear_state(user_id)
+        await cancel_user_flow(user_id)
         await query.message.edit_text("❌ Cancelled.", reply_markup=None)
         return
 
@@ -2498,7 +2739,15 @@ async def bulk_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── OTP: ready for next account ──────────────────────────────────────────
-    if data == "bb_next":
+    if data.startswith("bb_next_"):
+        try:
+            expected_idx = int(data.replace("bb_next_", "", 1))
+        except ValueError:
+            await query.answer("This button is no longer active.", show_alert=True)
+            return
+        if expected_idx != get_data(user_id).get("bb_otp_idx"):
+            await query.answer("This button is no longer active.", show_alert=True)
+            return
         await _bulk_otp_deliver_next(query, user_id, context)
         return
 
@@ -2634,24 +2883,42 @@ async def _bulk_deliver_sessions(query, user_id: int, accounts: list,
         )
         return
 
-    new_balance = user.get("balance", 0) - total_price
-    await db.users.update_one(
-        {"id": user_id},
-        {"$set": {"balance": new_balance}, "$inc": {"purchases": len(accounts)}}
-    )
     account_ids = [a["id"] for a in accounts]
-    await db.bulk_accounts.update_many(
-        {"id": {"$in": account_ids}},
-        {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
+
+    async def commit_bulk_session_purchase():
+        new_balance = user.get("balance", 0) - total_price
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {"balance": new_balance}, "$inc": {"purchases": len(accounts)}}
+        )
+        await db.bulk_accounts.update_many(
+            {"id": {"$in": account_ids}},
+            {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
+        )
+        user_doc = await db.users.find_one({"id": user_id})
+        if user_doc and user_doc.get("referred_by"):
+            await award_referral_commission(user_doc["referred_by"], user_id, total_price)
+        await db.transactions.insert_one({
+            "user_id": user_id, "type": "bulk_purchase",
+            "account_ids": account_ids, "amount": total_price,
+            "quantity": len(accounts), "timestamp": datetime.now()
+        })
+        return new_balance
+
+    async def complete_bulk_session_sale():
+        new_balance = await commit_bulk_session_purchase()
+        logged_out = await asyncio.gather(
+            *(
+                logout_sold_account_session(session_string=account.get("session"))
+                for account in accounts
+            )
+        )
+        return new_balance, all(logged_out)
+
+    new_balance, logged_out = await run_sale_operation(
+        user_id,
+        complete_bulk_session_sale(),
     )
-    user_doc = await db.users.find_one({"id": user_id})
-    if user_doc and user_doc.get("referred_by"):
-        await award_referral_commission(user_doc["referred_by"], user_id, total_price)
-    await db.transactions.insert_one({
-        "user_id": user_id, "type": "bulk_purchase",
-        "account_ids": account_ids, "amount": total_price,
-        "quantity": len(accounts), "timestamp": datetime.now()
-    })
 
     pr_inr = total_price * USD_TO_INR_RATE
     await query.message.edit_text(
@@ -2803,6 +3070,11 @@ async def _bulk_otp_login_done(query, user_id: int, acc_id: int, context):
     price_each = d.get("bb_otp_price_each", 0)
     wkey       = f"{user_id}_{idx}"
 
+    expected_acc_id = _bulk_expected_account_id(user_id)
+    if expected_acc_id != acc_id:
+        await query.answer("This button is no longer active.", show_alert=True)
+        return
+
     async def abort_bulk_watcher():
         watcher = BULK_OTP_WATCHERS.pop(wkey, None)
         if watcher:
@@ -2862,8 +3134,7 @@ async def _bulk_otp_login_done(query, user_id: int, acc_id: int, context):
             except Exception:
                 pass
 
-    try:
-        # Deduct and mark sold
+    async def commit_bulk_otp_purchase():
         new_balance = user.get("balance", 0) - price_each
         await db.users.update_one(
             {"id": user_id},
@@ -2880,15 +3151,28 @@ async def _bulk_otp_login_done(query, user_id: int, acc_id: int, context):
             "account_id": acc_id, "account_index": idx + 1,
             "amount": price_each, "timestamp": datetime.now()
         })
-    except Exception:
-        await abort_bulk_watcher()
-        raise
+        return new_balance
 
-    # Clean up watcher
-    tup  = BULK_OTP_WATCHERS.pop(wkey, None)
-    if tup:
-        tc, handler = tup
-        await close_telethon_client(tc, handler, log_out=True)
+    async def complete_bulk_otp_sale():
+        new_balance = await commit_bulk_otp_purchase()
+        watcher = BULK_OTP_WATCHERS.get(wkey)
+        if watcher:
+            logged_out = await finalize_sold_account_logout(
+                user_id,
+                watcher=watcher,
+            )
+            BULK_OTP_WATCHERS.pop(wkey, None)
+        else:
+            logged_out = await finalize_sold_account_logout(
+                user_id,
+                session_string=account.get("session"),
+            )
+        return new_balance, logged_out
+
+    new_balance, logged_out = await run_sale_operation(
+        user_id,
+        complete_bulk_otp_sale(),
+    )
 
     pr_inr = price_each * USD_TO_INR_RATE
     next_idx = idx + 1
@@ -2909,7 +3193,7 @@ async def _bulk_otp_login_done(query, user_id: int, acc_id: int, context):
         keyboard = [
             [InlineKeyboardButton(
                 f"✅ Ready for Account {next_idx+1}",
-                callback_data="bb_next"
+                callback_data=f"bb_next_{next_idx}"
             )],
             [InlineKeyboardButton("❌ Stop Here", callback_data="bb_cancel")]
         ]
@@ -4498,47 +4782,66 @@ async def main_async():
     health_runner, _health_site = await start_health_server()
     logger.info("Health server started on 0.0.0.0:%s", os.environ["PORT"])
 
-    application = Application.builder().token(API_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(API_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
 
     bot_instance = application.bot
 
     # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ping", ping_command))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("reply", admin_reply))
-    application.add_handler(CommandHandler("replyimg", admin_reply_with_image))
-    application.add_handler(CommandHandler("endchat", admin_endchat))
+    application.add_handler(CommandHandler("start", tracked_user_handler(start)))
+    application.add_handler(CommandHandler("ping", tracked_user_handler(ping_command)))
+    application.add_handler(CommandHandler("admin", tracked_user_handler(admin_panel)))
+    application.add_handler(CommandHandler("reply", tracked_user_handler(admin_reply)))
+    application.add_handler(CommandHandler("replyimg", tracked_user_handler(admin_reply_with_image)))
+    application.add_handler(CommandHandler("endchat", tracked_user_handler(admin_endchat)))
 
     # Callback query handlers
-    application.add_handler(CallbackQueryHandler(end_support, pattern="^end_support$"))
-    application.add_handler(CallbackQueryHandler(show_crypto_to_user, pattern="^deposit_crypto_list$"))
-    application.add_handler(CallbackQueryHandler(select_crypto_wallet, pattern="^crypto_select_"))
-    application.add_handler(CallbackQueryHandler(crypto_confirm_payment, pattern="^crypto_confirm_"))
-    application.add_handler(CallbackQueryHandler(crypto_cancel_payment, pattern="^crypto_cancel_"))
-    application.add_handler(CallbackQueryHandler(crypto_admin_decision, pattern="^crypto_(approve|reject)_"))
-    application.add_handler(CallbackQueryHandler(handle_upi_deposit, pattern="^deposit_upi$"))
-    application.add_handler(CallbackQueryHandler(user_buy_account, pattern="^buy_"))
-    application.add_handler(CallbackQueryHandler(show_accounts_page, pattern="^accpage_"))
-    application.add_handler(CallbackQueryHandler(handle_edit_price_button, pattern="^editprice_"))
-    application.add_handler(CallbackQueryHandler(handle_otp_login, pattern="^otp_login_"))
-    application.add_handler(CallbackQueryHandler(handle_session_file, pattern="^session_file_"))
-    application.add_handler(CallbackQueryHandler(send_2fa_password, pattern="^login_2fa_"))
-    application.add_handler(CallbackQueryHandler(back_to_login_screen, pattern="^back_to_login_"))
-    application.add_handler(CallbackQueryHandler(login_done_handler, pattern="^login_done_"))
-    application.add_handler(CallbackQueryHandler(handle_rating, pattern="^rate_"))
-    application.add_handler(CallbackQueryHandler(admin_panel_buttons, pattern="^admin_"))
-    application.add_handler(CallbackQueryHandler(handle_currency_selection, pattern="^currency_"))
-    application.add_handler(CallbackQueryHandler(handle_copy_referral, pattern="^copy_ref_"))
-    application.add_handler(CallbackQueryHandler(handle_back_buttons, pattern="^back_to_"))
+    def add_callback_handler(handler, pattern: str):
+        application.add_handler(
+            CallbackQueryHandler(
+                tracked_user_handler(handler, callback=True),
+                pattern=pattern,
+            )
+        )
+
+    add_callback_handler(end_support, "^end_support$")
+    add_callback_handler(show_crypto_to_user, "^deposit_crypto_list$")
+    add_callback_handler(select_crypto_wallet, "^crypto_select_")
+    add_callback_handler(crypto_confirm_payment, "^crypto_confirm_")
+    add_callback_handler(crypto_cancel_payment, "^crypto_cancel_")
+    add_callback_handler(crypto_admin_decision, "^crypto_(approve|reject)_")
+    add_callback_handler(handle_upi_deposit, "^deposit_upi$")
+    add_callback_handler(user_buy_account, "^buy_")
+    add_callback_handler(show_accounts_page, "^accpage_")
+    add_callback_handler(handle_edit_price_button, "^editprice_")
+    add_callback_handler(handle_otp_login, "^otp_login_")
+    add_callback_handler(handle_session_file, "^session_file_")
+    add_callback_handler(send_2fa_password, "^login_2fa_")
+    add_callback_handler(back_to_login_screen, "^back_to_login_")
+    add_callback_handler(login_done_handler, "^login_done_")
+    add_callback_handler(handle_rating, "^rate_")
+    add_callback_handler(admin_panel_buttons, "^admin_")
+    add_callback_handler(handle_currency_selection, "^currency_")
+    add_callback_handler(handle_copy_referral, "^copy_ref_")
+    add_callback_handler(handle_back_buttons, "^back_to_")
 
     # Bulk Buy handlers
-    application.add_handler(CallbackQueryHandler(bulk_buy_callback, pattern="^bb_"))
-    application.add_handler(CallbackQueryHandler(bulk_add_mode_callback, pattern="^ba_mode_"))
+    add_callback_handler(bulk_buy_callback, "^bb_")
+    add_callback_handler(bulk_add_mode_callback, "^ba_mode_")
 
     # Message handlers
-    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media_messages))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
+    application.add_handler(MessageHandler(
+        filters.PHOTO | filters.VIDEO | filters.Document.ALL,
+        tracked_user_handler(handle_media_messages),
+    ))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        tracked_user_handler(handle_text_messages),
+    ))
 
     logger.info("Bot is starting in Telegram polling mode")
     print(f"💰 Minimum deposit USD: ${MIN_DEPOSIT_USD}")
