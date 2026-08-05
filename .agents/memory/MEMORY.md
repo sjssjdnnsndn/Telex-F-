@@ -1,1 +1,2 @@
 - [Telegram bot runtime](telegram-bot-runtime.md) — one polling owner; the UPI API may send notifications but must never poll the same bot token.
+- [Account handoff cleanup](account-handoff-cleanup.md) — clean only Telegram Saved Messages before inventory/delivery, verify the watermark, and close Telethon watchers on every exit.

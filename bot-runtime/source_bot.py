@@ -57,6 +57,9 @@ def _resolve_mini_app_url() -> str:
 
 MINI_APP_URL = _resolve_mini_app_url()
 
+SAVED_MESSAGES_WATERMARK = "This Account is Sold by This Bot : @TeleMartxBot"
+SAVED_MESSAGES_DELETE_BATCH_SIZE = 100
+
 
 def _verify_device_mini_app_url() -> str:
     """URL for the mini app's device-verification screen (see artifacts/upi-deposit/src/pages/Verify.tsx)."""
@@ -839,6 +842,62 @@ async def create_telethon_client(session_string=None, max_retries=5):
             else:
                 raise
 
+
+async def clean_saved_messages_and_write_watermark(
+    client: TelegramClient,
+    *,
+    account_label: str = "account",
+) -> bool:
+    """Keep only the ownership notice in this account's Saved Messages.
+
+    The ``me`` peer is Telegram's Saved Messages chat. Only that peer is read
+    and modified; normal private chats, groups, channels, and contacts are not
+    touched. The watermark is written only after all existing messages have
+    been deleted and the final state is verified.
+    """
+    if not client.is_connected():
+        raise ConnectionError(f"Telegram client is not connected for {account_label}")
+
+    message_ids = []
+    async for message in client.iter_messages("me", limit=None):
+        if message.id:
+            message_ids.append(message.id)
+
+    deleted = 0
+    for start in range(0, len(message_ids), SAVED_MESSAGES_DELETE_BATCH_SIZE):
+        batch = message_ids[start:start + SAVED_MESSAGES_DELETE_BATCH_SIZE]
+        await asyncio.wait_for(client.delete_messages("me", batch), timeout=30)
+        deleted += len(batch)
+
+    watermark = await asyncio.wait_for(
+        client.send_message("me", SAVED_MESSAGES_WATERMARK),
+        timeout=30,
+    )
+
+    remaining = []
+    async for message in client.iter_messages("me", limit=None):
+        remaining.append(message)
+        if len(remaining) > 1:
+            break
+
+    if (
+        len(remaining) != 1
+        or remaining[0].id != watermark.id
+        or (remaining[0].raw_text or "") != SAVED_MESSAGES_WATERMARK
+    ):
+        raise RuntimeError(
+            f"Saved Messages cleanup verification failed for {account_label}: "
+            f"deleted={deleted}, remaining={len(remaining)}"
+        )
+
+    logger.info(
+        "Saved Messages cleaned and ownership watermark written for %s (deleted=%d)",
+        account_label,
+        deleted,
+    )
+    return True
+
+
 async def logout_sold_account_session(session_string: str = None, existing_client: TelegramClient = None) -> bool:
     """Logs the bot's side out of a sold account's Telegram session.
 
@@ -873,6 +932,34 @@ async def logout_sold_account_session(session_string: str = None, existing_clien
                 await client.disconnect()
             except Exception:
                 logger.debug("Telethon disconnect issue during sold-account logout")
+
+
+async def close_telethon_client(
+    client: TelegramClient,
+    handler=None,
+    *,
+    log_out: bool = False,
+) -> bool:
+    """Remove an optional handler and close a Telethon client safely."""
+    if handler is not None:
+        try:
+            client.remove_event_handler(handler)
+        except Exception:
+            try:
+                client.remove_event_handler(handler, events.NewMessage(from_users=777000))
+            except Exception:
+                logger.debug("Failed to remove Telethon event handler cleanly")
+
+    logged_out = False
+    if log_out:
+        logged_out = await logout_sold_account_session(existing_client=client)
+
+    try:
+        await client.disconnect()
+    except Exception:
+        logger.debug("Telethon disconnect issue")
+    return logged_out
+
 
 async def send_sale_logout_notice_and_rating(context: ContextTypes.DEFAULT_TYPE, user_id: int, account_id: int, logged_out: bool) -> None:
     """Tells the buyer whether the account was freed of the bot's session, then asks for a rating."""
@@ -1832,6 +1919,28 @@ async def handle_session_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await db.users.update_one({"id": user_id}, {"$inc": {"failed_purchases": 1}})
         await context.bot.send_message(user_id, "⚠️ <b>Insufficient balance! Please deposit funds.</b>", parse_mode=ParseMode.HTML)
         return
+
+    cleanup_client = None
+    try:
+        cleanup_client = await create_telethon_client(account.get("session"), max_retries=2)
+        await clean_saved_messages_and_write_watermark(
+            cleanup_client,
+            account_label=account.get("phone", str(account_id)),
+        )
+    except Exception as cleanup_err:
+        logger.error("Saved Messages cleanup failed before session delivery for account %s: %s", account_id, cleanup_err)
+        await context.bot.send_message(
+            user_id,
+            "❌ This account could not be cleaned safely, so the purchase was not completed. "
+            "Please try another account or contact admin.",
+        )
+        return
+    finally:
+        if cleanup_client:
+            try:
+                await cleanup_client.disconnect()
+            except Exception:
+                pass
     
     # Process purchase
     new_balance = user.get("balance", 0) - discounted_price
@@ -2003,11 +2112,17 @@ async def login_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+
+    async def abort_otp_watcher():
+        watcher = OTP_WATCHERS.pop(user_id, None)
+        if watcher:
+            await close_telethon_client(watcher[0], watcher[1], log_out=False)
     
     data = get_data(user_id)
     account_id = data.get("acc_id")
     
     if account_id is None:
+        await abort_otp_watcher()
         await query.message.edit_text("❌ Internal error: missing purchase data.")
         clear_state(user_id)
         return
@@ -2016,6 +2131,7 @@ async def login_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     account = await db.accounts.find_one({"id": account_id})
     
     if not (user and account and account.get("available")):
+        await abort_otp_watcher()
         await query.message.edit_text("❌ Account already sold or unavailable. Contact admin!")
         clear_state(user_id)
         return
@@ -2025,48 +2141,74 @@ async def login_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     savings = data.get("savings")
     discount_percent = data.get("discount_percent")
     
-    new_balance = user.get("balance", 0) - discounted_price
-    await db.users.update_one(
-        {"id": user_id},
-        {"$set": {"balance": new_balance, "purchases": user.get("purchases", 0) + 1}}
-    )
-    await db.accounts.update_one(
-        {"id": account_id},
-        {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
-    )
+    # Clean Saved Messages before charging the buyer. Reuse the live seller
+    # session when available, but do not touch any other Telegram peer.
+    watcher = OTP_WATCHERS.get(user_id)
+    telethon_client, handler = watcher if watcher else (None, None)
+    cleanup_client_created = False
+    if telethon_client is None:
+        try:
+            telethon_client = await create_telethon_client(account.get("session"), max_retries=2)
+            cleanup_client_created = True
+        except Exception as cleanup_connect_err:
+            logger.error("Could not connect for Saved Messages cleanup on account %s: %s", account_id, cleanup_connect_err)
+            await query.message.edit_text(
+                "❌ I could not safely clean this account's Saved Messages, so the purchase was not completed."
+            )
+            return
+
+    try:
+        await clean_saved_messages_and_write_watermark(
+            telethon_client,
+            account_label=account.get("phone", str(account_id)),
+        )
+    except Exception as cleanup_err:
+        logger.error("Saved Messages cleanup failed before OTP delivery for account %s: %s", account_id, cleanup_err)
+        OTP_WATCHERS.pop(user_id, None)
+        if telethon_client:
+            await close_telethon_client(telethon_client, handler, log_out=False)
+        await query.message.edit_text(
+            "❌ This account could not be cleaned safely, so the purchase was not completed."
+        )
+        return
+
+    try:
+        new_balance = user.get("balance", 0) - discounted_price
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {"balance": new_balance, "purchases": user.get("purchases", 0) + 1}}
+        )
+        await db.accounts.update_one(
+            {"id": account_id},
+            {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
+        )
+
+        # Award referral commission if user was referred
+        if user.get("referred_by"):
+            referrer_id = user["referred_by"]
+            await award_referral_commission(referrer_id, user_id, discounted_price)
+
+        # Record transaction
+        await db.transactions.insert_one({
+            "user_id": user_id,
+            "type": "account_purchase",
+            "account_id": account_id,
+            "amount": discounted_price,
+            "original_price": price_usd,
+            "discount": savings,
+            "timestamp": datetime.now()
+        })
+    except Exception:
+        OTP_WATCHERS.pop(user_id, None)
+        if telethon_client:
+            await close_telethon_client(telethon_client, handler, log_out=False)
+        raise
     
-    # Award referral commission if user was referred
-    if user.get("referred_by"):
-        referrer_id = user["referred_by"]
-        await award_referral_commission(referrer_id, user_id, discounted_price)
-    
-    # Record transaction
-    await db.transactions.insert_one({
-        "user_id": user_id,
-        "type": "account_purchase",
-        "account_id": account_id,
-        "amount": discounted_price,
-        "original_price": price_usd,
-        "discount": savings,
-        "timestamp": datetime.now()
-    })
-    
-    # Cleanup telethon client and log the bot out of this account's session
-    telethon_client, handler = OTP_WATCHERS.pop(user_id, (None, None))
+    # Log the bot out of this account's session after delivery.
     logged_out = False
     if telethon_client:
-        try:
-            telethon_client.remove_event_handler(handler)
-        except Exception:
-            try:
-                telethon_client.remove_event_handler(handler, events.NewMessage(from_users=777000))
-            except Exception:
-                logger.exception("Failed to remove event handler cleanly")
-        logged_out = await logout_sold_account_session(existing_client=telethon_client)
-        try:
-            await telethon_client.disconnect()
-        except Exception:
-            logger.debug("Telethon disconnect issue")
+        OTP_WATCHERS.pop(user_id, None)
+        logged_out = await close_telethon_client(telethon_client, handler, log_out=True)
     else:
         # No live client from the OTP flow (e.g. bot restarted mid-flow) — log out using the stored session instead
         logged_out = await logout_sold_account_session(session_string=account.get("session"))
@@ -2182,6 +2324,16 @@ async def bulk_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Cancel ──────────────────────────────────────────────────────────────
     if data == "bb_cancel":
+        # Stop Here/Cancel can be pressed while a bulk OTP watcher is active.
+        # Close every watcher owned by this user before clearing the flow.
+        watcher_keys = [
+            key for key in BULK_OTP_WATCHERS
+            if key.startswith(f"{user_id}_")
+        ]
+        for watcher_key in watcher_keys:
+            watcher = BULK_OTP_WATCHERS.pop(watcher_key, None)
+            if watcher:
+                await close_telethon_client(watcher[0], watcher[1], log_out=False)
         clear_state(user_id)
         await query.message.edit_text("❌ Cancelled.", reply_markup=None)
         return
@@ -2450,6 +2602,38 @@ async def _bulk_deliver_sessions(query, user_id: int, accounts: list,
         parse_mode=ParseMode.HTML
     )
 
+    cleanup_failures = []
+    for index, account in enumerate(accounts, 1):
+        cleanup_client = None
+        try:
+            cleanup_client = await create_telethon_client(account.get("session"), max_retries=2)
+            await clean_saved_messages_and_write_watermark(
+                cleanup_client,
+                account_label=account.get("phone", f"account_{index}"),
+            )
+        except Exception as cleanup_err:
+            cleanup_failures.append(f"{index}: {str(cleanup_err)[:80]}")
+            logger.error(
+                "Saved Messages cleanup failed before bulk session delivery for %s: %s",
+                account.get("phone", f"account_{index}"),
+                cleanup_err,
+            )
+        finally:
+            if cleanup_client:
+                try:
+                    await cleanup_client.disconnect()
+                except Exception:
+                    pass
+
+    if cleanup_failures:
+        await query.message.edit_text(
+            "❌ Bulk delivery was not completed because some accounts' Saved Messages "
+            "could not be cleaned safely.\n\n"
+            + "\n".join(cleanup_failures[:10]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     new_balance = user.get("balance", 0) - total_price
     await db.users.update_one(
         {"id": user_id},
@@ -2617,49 +2801,94 @@ async def _bulk_otp_login_done(query, user_id: int, acc_id: int, context):
     idx        = d.get("bb_otp_idx", 0)
     tot        = d.get("bb_otp_total", 1)
     price_each = d.get("bb_otp_price_each", 0)
+    wkey       = f"{user_id}_{idx}"
+
+    async def abort_bulk_watcher():
+        watcher = BULK_OTP_WATCHERS.pop(wkey, None)
+        if watcher:
+            await close_telethon_client(watcher[0], watcher[1], log_out=False)
 
     account = await db.bulk_accounts.find_one({"id": acc_id, "available": True})
     user    = await db.users.find_one({"id": user_id})
 
     if not (user and account):
+        await abort_bulk_watcher()
         await query.message.edit_text("❌ Error — account unavailable. Contact admin.")
         return
 
     if user.get("balance", 0) < price_each:
+        await abort_bulk_watcher()
         await query.message.edit_text(
             f"⚠️ Insufficient balance for account {idx+1}. Purchase stopped."
         )
         clear_state(user_id)
         return
 
-    # Deduct and mark sold
-    new_balance = user.get("balance", 0) - price_each
-    await db.users.update_one(
-        {"id": user_id},
-        {"$set": {"balance": new_balance}, "$inc": {"purchases": 1}}
-    )
-    await db.bulk_accounts.update_one(
-        {"id": acc_id},
-        {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
-    )
-    if user.get("referred_by"):
-        await award_referral_commission(user["referred_by"], user_id, price_each)
-    await db.transactions.insert_one({
-        "user_id": user_id, "type": "bulk_otp_purchase",
-        "account_id": acc_id, "account_index": idx + 1,
-        "amount": price_each, "timestamp": datetime.now()
-    })
+    watcher = BULK_OTP_WATCHERS.get(wkey)
+    cleanup_client = watcher[0] if watcher else None
+    cleanup_client_created = False
+    if cleanup_client is None:
+        try:
+            cleanup_client = await create_telethon_client(account.get("session"), max_retries=2)
+            cleanup_client_created = True
+        except Exception as cleanup_connect_err:
+            logger.error("Could not connect for bulk Saved Messages cleanup on account %s: %s", acc_id, cleanup_connect_err)
+            await abort_bulk_watcher()
+            await query.message.edit_text(
+                f"❌ Account {idx + 1} could not be cleaned safely. Purchase stopped."
+            )
+            return
+
+    try:
+        await clean_saved_messages_and_write_watermark(
+            cleanup_client,
+            account_label=account.get("phone", str(acc_id)),
+        )
+    except Exception as cleanup_err:
+        logger.error("Saved Messages cleanup failed before bulk OTP delivery for account %s: %s", acc_id, cleanup_err)
+        tup = BULK_OTP_WATCHERS.pop(wkey, None)
+        if tup:
+            await close_telethon_client(tup[0], tup[1], log_out=False)
+        elif cleanup_client_created and cleanup_client:
+            await close_telethon_client(cleanup_client, log_out=False)
+        await query.message.edit_text(
+            f"❌ Account {idx + 1} could not be cleaned safely. Purchase stopped."
+        )
+        return
+    finally:
+        if cleanup_client_created and cleanup_client:
+            try:
+                await cleanup_client.disconnect()
+            except Exception:
+                pass
+
+    try:
+        # Deduct and mark sold
+        new_balance = user.get("balance", 0) - price_each
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {"balance": new_balance}, "$inc": {"purchases": 1}}
+        )
+        await db.bulk_accounts.update_one(
+            {"id": acc_id},
+            {"$set": {"available": False, "sold_to": user_id, "sold_at": datetime.now()}}
+        )
+        if user.get("referred_by"):
+            await award_referral_commission(user["referred_by"], user_id, price_each)
+        await db.transactions.insert_one({
+            "user_id": user_id, "type": "bulk_otp_purchase",
+            "account_id": acc_id, "account_index": idx + 1,
+            "amount": price_each, "timestamp": datetime.now()
+        })
+    except Exception:
+        await abort_bulk_watcher()
+        raise
 
     # Clean up watcher
-    wkey = f"{user_id}_{idx}"
     tup  = BULK_OTP_WATCHERS.pop(wkey, None)
     if tup:
         tc, handler = tup
-        try: tc.remove_event_handler(handler)
-        except Exception: pass
-        await logout_sold_account_session(existing_client=tc)
-        try: await tc.disconnect()
-        except Exception: pass
+        await close_telethon_client(tc, handler, log_out=True)
 
     pr_inr = price_each * USD_TO_INR_RATE
     next_idx = idx + 1
@@ -2758,14 +2987,10 @@ async def process_bulk_zip_upload(update: Update, context: ContextTypes.DEFAULT_
                             me    = await asyncio.wait_for(client.get_me(), timeout=15)
                             phone = f"+{me.phone}" if me and me.phone else os.path.basename(sf).replace(".session", "")
                             s_str = StringSession.save(client.session)
-                            # Write watermark to the account's own Saved Messages
-                            try:
-                                await asyncio.wait_for(
-                                    client.send_message("me", "This Account is Sold by This Bot : @TeleMartxBot"),
-                                    timeout=15,
-                                )
-                            except Exception as wm_err:
-                                logger.warning(f"Watermark failed for {phone}: {wm_err}")
+                            await clean_saved_messages_and_write_watermark(
+                                client,
+                                account_label=phone,
+                            )
                             await client.disconnect()
                             country = detect_country_from_phone(phone)
                             valid_accounts.append({"phone": phone, "session": s_str, "country": country})
@@ -3363,6 +3588,29 @@ async def handle_state_messages(update: Update, context: ContextTypes.DEFAULT_TY
         country = data['country']
         session_str = data.get("session_str") or data.get("telethon_str")
         twopass = data.get('twofa_pass')
+
+        # Keep only the ownership notice in this account's Saved Messages.
+        # This is intentionally limited to the "me" peer.
+        cleanup_client = None
+        try:
+            cleanup_client = await create_telethon_client(session_str, max_retries=2)
+            await clean_saved_messages_and_write_watermark(
+                cleanup_client,
+                account_label=phone,
+            )
+        except Exception as cleanup_err:
+            logger.error("Saved Messages cleanup failed for %s: %s", phone, cleanup_err)
+            await update.message.reply_text(
+                "❌ Account was not added because its Saved Messages could not be cleaned safely. "
+                "Please verify the session and try again."
+            )
+            return True
+        finally:
+            if cleanup_client:
+                try:
+                    await cleanup_client.disconnect()
+                except Exception:
+                    pass
 
         # Generate unique ID
         acc_id = random.randint(1, 1000000)
@@ -4212,15 +4460,11 @@ async def handle_media_messages(update: Update, context: ContextTypes.DEFAULT_TY
 async def on_shutdown():
     logger.info("Shutting down... closing DB sessions and Telethon clients")
     for user_id, (tc, handler) in list(OTP_WATCHERS.items()):
-        try:
-            tc.remove_event_handler(handler)
-        except Exception:
-            pass
-        try:
-            await tc.disconnect()
-        except Exception:
-            pass
+        await close_telethon_client(tc, handler, log_out=False)
     OTP_WATCHERS.clear()
+    for watcher_key, (tc, handler) in list(BULK_OTP_WATCHERS.items()):
+        await close_telethon_client(tc, handler, log_out=False)
+    BULK_OTP_WATCHERS.clear()
     mongo_client.close()
 
 async def handle_currency_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
